@@ -44,29 +44,37 @@ export default {
 	},
 };
 
-// NEW: generate a summary using Workers AI
+// CHANGED: added gateway option as third argument
 async function generateSummary(title: string, url: string, env: Env): Promise<string> {
 	try {
-		const response = await env.AI.run('@cf/meta/llama-3.1-8b-instruct-fast', {
-			messages: [
-				{
-					role: 'system',
-					content:
-						'You are a helpful assistant that writes concise bookmark descriptions. Respond with exactly one sentence, no more than 20 words.',
+		const response = await env.AI.run(
+			'@cf/meta/llama-3.1-8b-instruct-fast',
+			{
+				messages: [
+					{
+						role: 'system',
+						content:
+							'You are a helpful assistant that writes concise bookmark descriptions. Respond with exactly one sentence, no more than 20 words.',
+					},
+					{
+						role: 'user',
+						content: `Write a one-sentence description for this bookmark:\nTitle: ${title}\nURL: ${url}`,
+					},
+				],
+			},
+			{
+				gateway: {
+					id: 'bookmark-gateway',
+					skipCache: false,
+					cacheTtl: 86400, // Cache summaries for 24 hours
 				},
-				{
-					role: 'user',
-					content: `Write a one-sentence description for this bookmark:\nTitle: ${title}\nURL: ${url}`,
-				},
-			],
-		});
+			},
+		);
 
-		// env.AI.run() returns an object like { response: "the text" }.
-		// So response.response accesses the generated text. This is not a typo!
 		return response.response?.trim() || '';
 	} catch (error) {
 		console.error('AI summary failed:', error);
-		return ''; // Fail gracefully - bookmark is saved without summary
+		return '';
 	}
 }
 
