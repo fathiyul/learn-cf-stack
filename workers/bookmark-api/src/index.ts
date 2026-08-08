@@ -2,8 +2,9 @@ interface Bookmark {
 	id: string;
 	url: string;
 	title: string;
-	tags: string; // NEW: comma-separated tags
-	created_at: string; // NEW: from D1 DATETIME
+	tags: string;
+	summary: string; // NEW: AI-generated summary
+	created_at: string;
 }
 
 export default {
@@ -32,8 +33,9 @@ export default {
 		if (path === '/') {
 			return Response.json({
 				name: 'Bookmark API',
-				version: '3.0.0',
+				version: '4.0.0',
 				storage: 'D1 + KV cache',
+				ai: 'Workers AI (auto-summary)',
 				endpoints: ['GET /bookmarks', 'GET /bookmarks?tag=docs', 'POST /bookmarks', 'GET /bookmarks/:id', 'DELETE /bookmarks/:id'],
 			});
 		}
@@ -42,31 +44,33 @@ export default {
 	},
 };
 
-// CHANGED: query D1, support filtering by tag
-async function listBookmarks(env: Env, url: URL): Promise<Response> {
-	const tag = url.searchParams.get('tag');
+// NEW: generate a summary using Workers AI
+async function generateSummary(title: string, url: string, env: Env): Promise<string> {
+	try {
+		const response = await env.AI.run('@cf/meta/llama-3.1-8b-instruct-fast', {
+			messages: [
+				{
+					role: 'system',
+					content:
+						'You are a helpful assistant that writes concise bookmark descriptions. Respond with exactly one sentence, no more than 20 words.',
+				},
+				{
+					role: 'user',
+					content: `Write a one-sentence description for this bookmark:\nTitle: ${title}\nURL: ${url}`,
+				},
+			],
+		});
 
-	let results: Bookmark[];
-
-	if (tag) {
-		// Filter by tag using LIKE (tags is comma-separated)
-		const { results: rows } = await env.DB.prepare(`SELECT * FROM bookmarks WHERE tags LIKE ? ORDER BY created_at DESC`)
-			.bind(`%${tag}%`)
-			.all<Bookmark>();
-		results = rows;
-	} else {
-		const { results: rows } = await env.DB.prepare(`SELECT * FROM bookmarks ORDER BY created_at DESC`).all<Bookmark>();
-		results = rows;
+		// env.AI.run() returns an object like { response: "the text" }.
+		// So response.response accesses the generated text. This is not a typo!
+		return response.response?.trim() || '';
+	} catch (error) {
+		console.error('AI summary failed:', error);
+		return ''; // Fail gracefully - bookmark is saved without summary
 	}
-
-	return Response.json({ bookmarks: results, count: results.length });
 }
 
-// CHANGED: write to D1, then cache in KV
-// NOTE on SQL safety: every user-provided value is passed through .bind(),
-// which uses parameterized queries. This prevents SQL injection, even when
-// using LIKE with wildcards like %${tag}%. Never concatenate user input
-// directly into SQL strings.
+// CHANGED: calls generateSummary before saving
 async function createBookmark(request: Request, env: Env): Promise<Response> {
 	let body: { url?: string; title?: string; tags?: string };
 
@@ -83,47 +87,65 @@ async function createBookmark(request: Request, env: Env): Promise<Response> {
 	const id = crypto.randomUUID().slice(0, 8);
 	const tags = body.tags || '';
 
-	// Write to D1 (source of truth)
+	// NEW: generate AI summary
+	const summary = await generateSummary(body.title, body.url, env);
+
+	// Write to D1 (now includes summary)
 	const result = await env.DB.prepare(
-		`INSERT INTO bookmarks (id, url, title, tags)
-     VALUES (?, ?, ?, ?)
+		`INSERT INTO bookmarks (id, url, title, tags, summary)
+     VALUES (?, ?, ?, ?, ?)
      RETURNING *`,
 	)
-		.bind(id, body.url, body.title, tags)
+		.bind(id, body.url, body.title, tags, summary)
 		.first<Bookmark>();
 
 	if (!result) {
 		return Response.json({ error: 'Failed to create bookmark' }, { status: 500 });
 	}
 
-	// Cache in KV for fast reads
+	// Cache in KV
 	await env.BOOKMARKS.put(id, JSON.stringify(result), { expirationTtl: 3600 });
 
 	return Response.json(result, { status: 201 });
 }
 
-// CHANGED: check KV cache first, fall back to D1
+// UNCHANGED from Step 4
+async function listBookmarks(env: Env, url: URL): Promise<Response> {
+	const tag = url.searchParams.get('tag');
+
+	let results: Bookmark[];
+
+	if (tag) {
+		const { results: rows } = await env.DB.prepare(`SELECT * FROM bookmarks WHERE tags LIKE ? ORDER BY created_at DESC`)
+			.bind(`%${tag}%`)
+			.all<Bookmark>();
+		results = rows;
+	} else {
+		const { results: rows } = await env.DB.prepare(`SELECT * FROM bookmarks ORDER BY created_at DESC`).all<Bookmark>();
+		results = rows;
+	}
+
+	return Response.json({ bookmarks: results, count: results.length });
+}
+
+// UNCHANGED from Step 4
 async function getBookmark(id: string, env: Env): Promise<Response> {
-	// Try KV cache first
 	const cached = await env.BOOKMARKS.get<Bookmark>(id, 'json');
 	if (cached) {
 		return Response.json({ ...cached, _cached: true });
 	}
 
-	// Fall back to D1
 	const bookmark = await env.DB.prepare('SELECT * FROM bookmarks WHERE id = ?').bind(id).first<Bookmark>();
 
 	if (!bookmark) {
 		return Response.json({ error: 'Bookmark not found' }, { status: 404 });
 	}
 
-	// Populate cache for next time
 	await env.BOOKMARKS.put(id, JSON.stringify(bookmark), { expirationTtl: 3600 });
-
 	return Response.json(bookmark);
 }
 
-// CHANGED: delete from D1 and invalidate KV cache
+// UNCHANGED from Step 4
 async function deleteBookmark(id: string, env: Env): Promise<Response> {
 	const existing = await env.DB.prepare('SELECT id FROM bookmarks WHERE id = ?').bind(id).first();
 
@@ -131,10 +153,7 @@ async function deleteBookmark(id: string, env: Env): Promise<Response> {
 		return Response.json({ error: 'Bookmark not found' }, { status: 404 });
 	}
 
-	// Delete from D1
 	await env.DB.prepare('DELETE FROM bookmarks WHERE id = ?').bind(id).run();
-
-	// Invalidate KV cache
 	await env.BOOKMARKS.delete(id);
 
 	return Response.json({ message: 'Bookmark deleted' });
