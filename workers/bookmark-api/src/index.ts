@@ -5,8 +5,8 @@ interface Bookmark {
 	createdAt: string;
 }
 
-// In-memory store (lost on restart, we will fix this in Step 3)
-const bookmarks: Map<string, Bookmark> = new Map();
+// REMOVED: const bookmarks: Map<string, Bookmark> = new Map();
+// Bookmarks are now stored in KV via env.BOOKMARKS
 
 export default {
 	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -14,39 +14,30 @@ export default {
 		const path = url.pathname;
 		const method = request.method;
 
-		// GET /bookmarks - list all (optionally filtered by ?search=term)
+		// CHANGED: all handlers now receive env for KV access
 		if (path === '/bookmarks' && method === 'GET') {
-			return listBookmarks(url.searchParams.get('search'));
+			return listBookmarks(env);
 		}
 
-		// POST /bookmarks - create
 		if (path === '/bookmarks' && method === 'POST') {
-			return createBookmark(request);
+			return createBookmark(request, env);
 		}
 
-		// Match /bookmarks/:id pattern (used by both GET and DELETE below)
 		const match = path.match(/^\/bookmarks\/([a-zA-Z0-9_-]+)$/);
-
-		// GET /bookmarks/:id - get one
 		if (match && method === 'GET') {
-			return getBookmark(match[1]);
+			return getBookmark(match[1], env);
 		}
 
-		// PUT /bookmarks/:id - update one
-		if (match && method === 'PUT') {
-			return updateBookmark(match[1], request);
-		}
-
-		// DELETE /bookmarks/:id - delete one
 		if (match && method === 'DELETE') {
-			return deleteBookmark(match[1]);
+			return deleteBookmark(match[1], env);
 		}
 
-		// Fallback
 		if (path === '/') {
 			return Response.json({
 				name: 'Bookmark API',
-				endpoints: ['GET /bookmarks', 'POST /bookmarks', 'GET /bookmarks/:id', 'PUT /bookmarks/:id', 'DELETE /bookmarks/:id'],
+				version: '2.0.0',
+				storage: 'Workers KV',
+				endpoints: ['GET /bookmarks', 'POST /bookmarks', 'GET /bookmarks/:id', 'DELETE /bookmarks/:id'],
 			});
 		}
 
@@ -54,17 +45,24 @@ export default {
 	},
 };
 
-function listBookmarks(search: string | null): Response {
-	const all = Array.from(bookmarks.values()).filter((bookmark) => {
-		if (!search) {
-			return true;
-		}
-		return bookmark.title.toLowerCase().includes(search.toLowerCase());
-	});
+// CHANGED: list from KV using .list() + individual .get() calls
+// NOTE: This fetches each value individually (N+1 pattern). Fine for small
+// datasets, but for better performance at scale, store titles as KV metadata
+// so you can list without fetching each value (see the challenge below).
+async function listBookmarks(env: Env): Promise<Response> {
+	const keys = await env.BOOKMARKS.list();
+	const all: Bookmark[] = [];
+
+	for (const key of keys.keys) {
+		const value = await env.BOOKMARKS.get<Bookmark>(key.name, 'json');
+		if (value) all.push(value);
+	}
+
 	return Response.json({ bookmarks: all, count: all.length });
 }
 
-async function createBookmark(request: Request): Promise<Response> {
+// CHANGED: store in KV with .put()
+async function createBookmark(request: Request, env: Env): Promise<Response> {
 	let body: { url?: string; title?: string };
 
 	try {
@@ -85,51 +83,27 @@ async function createBookmark(request: Request): Promise<Response> {
 		createdAt: new Date().toISOString(),
 	};
 
-	bookmarks.set(id, bookmark);
+	// Store as JSON in KV, keyed by ID
+	await env.BOOKMARKS.put(id, JSON.stringify(bookmark));
 
 	return Response.json(bookmark, { status: 201 });
 }
 
-function getBookmark(id: string): Response {
-	const bookmark = bookmarks.get(id);
+// CHANGED: retrieve from KV with .get()
+async function getBookmark(id: string, env: Env): Promise<Response> {
+	const bookmark = await env.BOOKMARKS.get<Bookmark>(id, 'json');
 	if (!bookmark) {
 		return Response.json({ error: 'Bookmark not found' }, { status: 404 });
 	}
 	return Response.json(bookmark);
 }
 
-async function updateBookmark(id: string, request: Request): Promise<Response> {
-	const bookmark = bookmarks.get(id);
-	if (!bookmark) {
+// CHANGED: delete from KV with .delete()
+async function deleteBookmark(id: string, env: Env): Promise<Response> {
+	const existing = await env.BOOKMARKS.get(id);
+	if (!existing) {
 		return Response.json({ error: 'Bookmark not found' }, { status: 404 });
 	}
-
-	let body: { url?: string; title?: string };
-
-	try {
-		body = (await request.json()) as { url?: string; title?: string };
-	} catch {
-		return Response.json({ error: 'Invalid JSON in request body' }, { status: 400 });
-	}
-
-	if (body.url === undefined && body.title === undefined) {
-		return Response.json({ error: 'No fields to update: provide url and/or title' }, { status: 400 });
-	}
-
-	if (body.url !== undefined) {
-		bookmark.url = body.url;
-	}
-	if (body.title !== undefined) {
-		bookmark.title = body.title;
-	}
-
-	return Response.json(bookmark);
-}
-
-function deleteBookmark(id: string): Response {
-	if (!bookmarks.has(id)) {
-		return Response.json({ error: 'Bookmark not found' }, { status: 404 });
-	}
-	bookmarks.delete(id);
+	await env.BOOKMARKS.delete(id);
 	return Response.json({ message: 'Bookmark deleted' });
 }
