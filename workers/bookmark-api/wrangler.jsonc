@@ -22,7 +22,7 @@
 	],
 	"d1_databases": [
 		{
-			"binding": "bookmark_db",
+			"binding": "DB",
 			"database_name": "bookmark-db",
 			"database_id": "3b6564d1-8183-4b64-8abc-cfb39acf87a8"
 		}
