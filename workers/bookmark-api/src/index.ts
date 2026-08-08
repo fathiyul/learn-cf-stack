@@ -2,11 +2,9 @@ interface Bookmark {
 	id: string;
 	url: string;
 	title: string;
-	createdAt: string;
+	tags: string; // NEW: comma-separated tags
+	created_at: string; // NEW: from D1 DATETIME
 }
-
-// REMOVED: const bookmarks: Map<string, Bookmark> = new Map();
-// Bookmarks are now stored in KV via env.BOOKMARKS
 
 export default {
 	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -14,9 +12,8 @@ export default {
 		const path = url.pathname;
 		const method = request.method;
 
-		// CHANGED: all handlers now receive env for KV access
 		if (path === '/bookmarks' && method === 'GET') {
-			return listBookmarks(env);
+			return listBookmarks(env, url);
 		}
 
 		if (path === '/bookmarks' && method === 'POST') {
@@ -35,9 +32,9 @@ export default {
 		if (path === '/') {
 			return Response.json({
 				name: 'Bookmark API',
-				version: '2.0.0',
-				storage: 'Workers KV',
-				endpoints: ['GET /bookmarks', 'POST /bookmarks', 'GET /bookmarks/:id', 'DELETE /bookmarks/:id'],
+				version: '3.0.0',
+				storage: 'D1 + KV cache',
+				endpoints: ['GET /bookmarks', 'GET /bookmarks?tag=docs', 'POST /bookmarks', 'GET /bookmarks/:id', 'DELETE /bookmarks/:id'],
 			});
 		}
 
@@ -45,28 +42,36 @@ export default {
 	},
 };
 
-// CHANGED: list from KV using .list() + individual .get() calls
-// NOTE: This fetches each value individually (N+1 pattern). Fine for small
-// datasets, but for better performance at scale, store titles as KV metadata
-// so you can list without fetching each value (see the challenge below).
-async function listBookmarks(env: Env): Promise<Response> {
-	const keys = await env.BOOKMARKS.list();
-	const all: Bookmark[] = [];
+// CHANGED: query D1, support filtering by tag
+async function listBookmarks(env: Env, url: URL): Promise<Response> {
+	const tag = url.searchParams.get('tag');
 
-	for (const key of keys.keys) {
-		const value = await env.BOOKMARKS.get<Bookmark>(key.name, 'json');
-		if (value) all.push(value);
+	let results: Bookmark[];
+
+	if (tag) {
+		// Filter by tag using LIKE (tags is comma-separated)
+		const { results: rows } = await env.DB.prepare(`SELECT * FROM bookmarks WHERE tags LIKE ? ORDER BY created_at DESC`)
+			.bind(`%${tag}%`)
+			.all<Bookmark>();
+		results = rows;
+	} else {
+		const { results: rows } = await env.DB.prepare(`SELECT * FROM bookmarks ORDER BY created_at DESC`).all<Bookmark>();
+		results = rows;
 	}
 
-	return Response.json({ bookmarks: all, count: all.length });
+	return Response.json({ bookmarks: results, count: results.length });
 }
 
-// CHANGED: store in KV with .put()
+// CHANGED: write to D1, then cache in KV
+// NOTE on SQL safety: every user-provided value is passed through .bind(),
+// which uses parameterized queries. This prevents SQL injection, even when
+// using LIKE with wildcards like %${tag}%. Never concatenate user input
+// directly into SQL strings.
 async function createBookmark(request: Request, env: Env): Promise<Response> {
-	let body: { url?: string; title?: string };
+	let body: { url?: string; title?: string; tags?: string };
 
 	try {
-		body = (await request.json()) as { url?: string; title?: string };
+		body = (await request.json()) as { url?: string; title?: string; tags?: string };
 	} catch {
 		return Response.json({ error: 'Invalid JSON in request body' }, { status: 400 });
 	}
@@ -76,34 +81,61 @@ async function createBookmark(request: Request, env: Env): Promise<Response> {
 	}
 
 	const id = crypto.randomUUID().slice(0, 8);
-	const bookmark: Bookmark = {
-		id,
-		url: body.url,
-		title: body.title,
-		createdAt: new Date().toISOString(),
-	};
+	const tags = body.tags || '';
 
-	// Store as JSON in KV, keyed by ID
-	await env.BOOKMARKS.put(id, JSON.stringify(bookmark));
+	// Write to D1 (source of truth)
+	const result = await env.DB.prepare(
+		`INSERT INTO bookmarks (id, url, title, tags)
+     VALUES (?, ?, ?, ?)
+     RETURNING *`,
+	)
+		.bind(id, body.url, body.title, tags)
+		.first<Bookmark>();
 
-	return Response.json(bookmark, { status: 201 });
+	if (!result) {
+		return Response.json({ error: 'Failed to create bookmark' }, { status: 500 });
+	}
+
+	// Cache in KV for fast reads
+	await env.BOOKMARKS.put(id, JSON.stringify(result), { expirationTtl: 3600 });
+
+	return Response.json(result, { status: 201 });
 }
 
-// CHANGED: retrieve from KV with .get()
+// CHANGED: check KV cache first, fall back to D1
 async function getBookmark(id: string, env: Env): Promise<Response> {
-	const bookmark = await env.BOOKMARKS.get<Bookmark>(id, 'json');
+	// Try KV cache first
+	const cached = await env.BOOKMARKS.get<Bookmark>(id, 'json');
+	if (cached) {
+		return Response.json({ ...cached, _cached: true });
+	}
+
+	// Fall back to D1
+	const bookmark = await env.DB.prepare('SELECT * FROM bookmarks WHERE id = ?').bind(id).first<Bookmark>();
+
 	if (!bookmark) {
 		return Response.json({ error: 'Bookmark not found' }, { status: 404 });
 	}
+
+	// Populate cache for next time
+	await env.BOOKMARKS.put(id, JSON.stringify(bookmark), { expirationTtl: 3600 });
+
 	return Response.json(bookmark);
 }
 
-// CHANGED: delete from KV with .delete()
+// CHANGED: delete from D1 and invalidate KV cache
 async function deleteBookmark(id: string, env: Env): Promise<Response> {
-	const existing = await env.BOOKMARKS.get(id);
+	const existing = await env.DB.prepare('SELECT id FROM bookmarks WHERE id = ?').bind(id).first();
+
 	if (!existing) {
 		return Response.json({ error: 'Bookmark not found' }, { status: 404 });
 	}
+
+	// Delete from D1
+	await env.DB.prepare('DELETE FROM bookmarks WHERE id = ?').bind(id).run();
+
+	// Invalidate KV cache
 	await env.BOOKMARKS.delete(id);
+
 	return Response.json({ message: 'Bookmark deleted' });
 }
