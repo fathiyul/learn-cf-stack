@@ -19,6 +19,13 @@
 			"binding": "BOOKMARKS",
 			"id": "1d55fb89179f46d295a56456ea1915dc"
 		}
+	],
+	"d1_databases": [
+		{
+			"binding": "bookmark_db",
+			"database_name": "bookmark-db",
+			"database_id": "3b6564d1-8183-4b64-8abc-cfb39acf87a8"
+		}
 	]
 	/**
 	 * Smart Placement
