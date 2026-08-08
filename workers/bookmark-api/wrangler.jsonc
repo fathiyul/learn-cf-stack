@@ -26,7 +26,10 @@
 			"database_name": "bookmark-db",
 			"database_id": "3b6564d1-8183-4b64-8abc-cfb39acf87a8"
 		}
-	]
+	],
+	"ai": {
+		"binding": "AI"
+	}
 	/**
 	 * Smart Placement
 	 * https://developers.cloudflare.com/workers/configuration/smart-placement/#smart-placement
