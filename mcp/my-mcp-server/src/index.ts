@@ -54,6 +54,22 @@ function createServer() {
     },
   );
 
+  server.registerTool(
+    "generate_random_number",
+    {
+      description: "Generates a random number between two numbers",
+      inputSchema: z.object({ min: z.number(), max: z.number() }),
+    },
+    async ({ min, max }) => ({
+      content: [
+        {
+          type: "text",
+          text: String(Math.floor(Math.random() * (max - min + 1)) + min),
+        },
+      ],
+    }),
+  );
+
   return server;
 }
 
