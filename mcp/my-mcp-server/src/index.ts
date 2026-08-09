@@ -57,17 +57,53 @@ function createServer() {
   server.registerTool(
     "generate_random_number",
     {
-      description: "Generates a random number between two numbers",
+      description: "Generates a truly random number between two numbers",
       inputSchema: z.object({ min: z.number(), max: z.number() }),
     },
-    async ({ min, max }) => ({
-      content: [
-        {
-          type: "text",
-          text: String(Math.floor(Math.random() * (max - min + 1)) + min),
-        },
-      ],
-    }),
+    async ({ min, max }) => {
+      try {
+        // Fetch true randomness from the drand beacon endpoint
+        const response = await fetch(
+          "https://drand.cloudflare.com/public/latest",
+        );
+        const data = (await response.json()) as {
+          round: number;
+          signature: string;
+          previous_signature: string;
+          randomness: string;
+        };
+
+        // Process randomness
+        const randomHex = data.randomness;
+        const startIndex = Math.floor(Math.random() * (randomHex.length - 8));
+        const randomValue = parseInt(
+          randomHex.slice(startIndex, startIndex + 8),
+          16,
+        );
+
+        // Scale to requested range
+        const scaledRandom = min + (Math.abs(randomValue) % (max - min + 1));
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: String(scaledRandom),
+            },
+          ],
+        };
+      } catch {
+        // Fallback to Math.random() if drand fails
+        return {
+          content: [
+            {
+              type: "text",
+              text: String(Math.floor(Math.random() * (max - min + 1)) + min),
+            },
+          ],
+        };
+      }
+    },
   );
 
   return server;
